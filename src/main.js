@@ -51,6 +51,13 @@ let previewEmitAt = 0;
 
 socket.on('connect', () => {
   state.error = '';
+  // A dropped connection (wifi blip, sleep, tab suspend) gets a fresh socket.id from
+  // socket.io's automatic reconnect. The server treats the old socket's disconnect as
+  // a permanent room departure, so without this the client is stuck showing a stale
+  // room with no way back in. Rejoin the same room/name automatically when possible.
+  if (state.view === 'room' && state.roomCode) {
+    socket.emit('room:join', { code: state.roomCode, name: state.name });
+  }
   render();
 });
 
@@ -65,14 +72,26 @@ socket.on('room:error', (message) => {
 });
 
 socket.on('room:state', (roomState) => {
+  const enteringRoom = state.view !== 'room';
   Object.assign(state, roomState, {
     view: 'room',
     modal: state.modal,
     error: '',
-    previewStroke: null
+    // room:state doesn't carry the transient in-progress stroke. Only clear our own
+    // preview if we aren't actively mid-stroke, otherwise every per-second timer tick
+    // would blank the line the user is currently drawing.
+    previewStroke: isDrawing ? state.previewStroke : null
   });
   window.history.replaceState(null, '', `?${state.roomCode}`);
-  render();
+  // The room shell (chat input, canvas, tool buttons) is only built once on entry.
+  // Later updates patch the DOM in place instead of replacing #app's innerHTML,
+  // otherwise every timer tick / chat message would tear down the canvas mid-stroke
+  // and wipe the chat input's focus and in-progress text.
+  if (enteringRoom) {
+    render();
+  } else {
+    patchRoom();
+  }
 });
 
 socket.on('drawing:preview', (stroke) => {
@@ -238,6 +257,88 @@ function roomTemplate() {
     ${state.modal === 'settings' ? settingsModal() : ''}
     ${state.modal === 'invite' ? inviteModal() : ''}
   `;
+}
+
+// Applies a room:state update to the already-rendered room DOM without touching
+// #app.innerHTML, so the chat input keeps its focus/typed text and the canvas keeps
+// its bound pointer handlers and any in-progress stroke. See render()/room:state above.
+function patchRoom() {
+  const isUserDrawing = isDrawer() && state.phase === 'draw';
+  const isOwner = state.players.find((player) => player.id === state.myId)?.owner;
+  const wordDisplay = state.phase === 'draw' ? state.wordHint : 'Waiting for word';
+  const drawer = state.players.find((player) => player.id === state.drawerId);
+
+  setText('.round-chip', `Round ${state.round}/${state.roomSettings.rounds}`);
+  setText('.word-chip', wordDisplay);
+  setText('.timer', `${state.seconds}s`);
+
+  const settingsButton = document.querySelector('[data-action="settings"]');
+  if (settingsButton) settingsButton.disabled = !isOwner;
+
+  const playersList = document.querySelector('.players-list');
+  if (playersList) {
+    playersList.innerHTML = state.players.map((player) => `
+      <div class="player-row ${player.id === state.drawerId ? 'active' : ''}">
+        <div class="avatar" style="--avatar:${player.color}">${escapeHtml(player.name.slice(0, 1))}</div>
+        <div class="player-meta">
+          <strong>${escapeHtml(player.name)} ${player.owner ? '<span title="Owner">★</span>' : ''}</strong>
+          <span>${player.score} pts</span>
+        </div>
+        ${player.guessed ? '<span class="guessed">✓</span>' : ''}
+      </div>
+    `).join('');
+  }
+
+  const drawerBanner = document.querySelector('.drawer-banner');
+  if (drawerBanner) {
+    drawerBanner.innerHTML = `
+      <span>${drawer ? `${escapeHtml(drawer.name)} ${state.phase === 'choose' ? 'is choosing' : 'is drawing'}` : 'Waiting for players'}</span>
+      <strong>${bannerText(isUserDrawing)}</strong>
+    `;
+  }
+
+  const boardPanel = document.querySelector('.board-panel');
+  const existingChooser = boardPanel?.querySelector('.word-chooser');
+  if (state.phase === 'choose' && isDrawer()) {
+    if (existingChooser) existingChooser.outerHTML = wordChooser();
+    else boardPanel.insertAdjacentHTML('afterbegin', wordChooser());
+  } else if (existingChooser) {
+    existingChooser.remove();
+  }
+
+  document.querySelectorAll(
+    '.toolstrip [data-tool], .toolstrip [data-action="undo"], .toolstrip [data-action="clear"], #brush-size, .swatch'
+  ).forEach((element) => { element.disabled = !isUserDrawing; });
+  document.querySelectorAll('.tool[data-tool]').forEach((element) => {
+    element.classList.toggle('selected', element.dataset.tool === state.tool);
+  });
+  document.querySelectorAll('.swatch').forEach((element) => {
+    element.classList.toggle('selected', element.dataset.color === state.selectedColor);
+  });
+
+  const chatLog = document.querySelector('#chat-log');
+  if (chatLog) {
+    chatLog.innerHTML = state.messages.map((message) => `
+      <p class="${message.kind || ''}"><strong>${escapeHtml(message.name)}:</strong> ${escapeHtml(message.text)}</p>
+    `).join('');
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  const chatDisabled = isUserDrawing || state.phase !== 'draw';
+  const chatInput = document.querySelector('#chat-input');
+  if (chatInput) {
+    chatInput.disabled = chatDisabled;
+    chatInput.placeholder = isUserDrawing ? 'You are drawing' : 'Type your guess';
+  }
+  const chatSendButton = document.querySelector('.chat-form button');
+  if (chatSendButton) chatSendButton.disabled = chatDisabled;
+
+  redrawCanvas();
+}
+
+function setText(selector, text) {
+  const element = document.querySelector(selector);
+  if (element) element.textContent = text;
 }
 
 function bannerText(isUserDrawing) {
@@ -510,6 +611,9 @@ function moveStroke(event) {
 function finishStroke() {
   if (!isDrawing || !currentStroke) return;
   socket.emit('drawing:commit', currentStroke);
+  // Commit locally right away (server now only echoes to other clients) so the
+  // stroke doesn't flash away and wait on a network round trip to reappear.
+  state.strokes.push(currentStroke);
   state.previewStroke = null;
   isDrawing = false;
   currentStroke = null;
