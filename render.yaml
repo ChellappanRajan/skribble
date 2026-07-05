@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: skribble-clone
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
