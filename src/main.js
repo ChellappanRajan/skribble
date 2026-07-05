@@ -124,6 +124,15 @@ function render() {
   }
 }
 
+// Derived (not stored) so an invite-code hint doesn't get wiped by the
+// socket 'connect' handler's state.error reset, which fires moments after
+// initial page load and previously erased the hint before it could be read.
+function homeNotice() {
+  if (state.error) return state.error;
+  if (state.joinCode) return `Invite detected: ${state.joinCode}. Enter a nickname and press Join Room.`;
+  return '';
+}
+
 function homeTemplate() {
   return `
     <main class="home-shell">
@@ -137,7 +146,7 @@ function homeTemplate() {
         </div>
 
         <div class="join-panel">
-          ${state.error ? `<p class="error-banner">${escapeHtml(state.error)}</p>` : ''}
+          ${homeNotice() ? `<p class="error-banner">${escapeHtml(homeNotice())}</p>` : ''}
           <label for="player-name">Nickname</label>
           <input id="player-name" value="${escapeHtml(state.name)}" maxlength="18" autocomplete="off" />
           <label for="room-code">Room code</label>
@@ -440,6 +449,7 @@ function bindCommon() {
   });
   document.querySelector('#room-code')?.addEventListener('input', (event) => {
     state.joinCode = event.target.value.toUpperCase();
+    event.target.value = state.joinCode;
   });
   document.querySelector('#language-select')?.addEventListener('change', (event) => {
     state.roomSettings.language = event.target.value;
@@ -482,7 +492,12 @@ function handleClick(event) {
     return;
   }
   if (!actionTarget) return;
-  if (actionTarget.closest('.modal') && backdrop) return;
+  // Clicking anywhere inside the modal (e.g. a heading, or empty space in the
+  // settings form) bubbles up to the backdrop's own data-action="close-modal",
+  // since it's the nearest ancestor carrying one. Only actually close when the
+  // click landed on the backdrop itself — the close button has its own
+  // data-action directly on it, so it's unaffected by this guard.
+  if (actionTarget.classList.contains('modal-backdrop') && !backdrop) return;
 
   const action = actionTarget.dataset.action;
   if (action === 'quick-play') createRoom(false);
@@ -673,10 +688,6 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
-}
-
-if (state.joinCode) {
-  state.error = `Invite detected: ${state.joinCode}. Enter a nickname and press Join Room.`;
 }
 
 render();
