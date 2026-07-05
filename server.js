@@ -100,6 +100,12 @@ io.on('connection', (socket) => {
         player.score += Math.max(25, room.seconds + 10);
       }
       addMessage(room, player.name, 'guessed the word!', 'correct');
+      const guessers = room.players.filter((p) => p.id !== currentDrawer(room).id);
+      if (guessers.length && guessers.every((p) => p.guessed)) {
+        addMessage(room, 'System', `Everyone guessed "${room.currentWord}"!`, 'system');
+        advanceTurn(room);
+        return;
+      }
     } else {
       addMessage(room, player.name, message);
     }
@@ -115,8 +121,9 @@ io.on('connection', (socket) => {
   socket.on('drawing:commit', (stroke) => {
     const room = getSocketRoom(socket);
     if (!canDraw(room, socket.id) || !isValidStroke(stroke)) return;
-    room.strokes.push(trimStroke(stroke));
-    io.to(room.code).emit('drawing:commit', trimStroke(stroke));
+    const trimmed = trimStroke(stroke);
+    room.strokes.push(trimmed);
+    socket.to(room.code).emit('drawing:commit', trimmed);
   });
 
   socket.on('drawing:undo', () => {
@@ -137,7 +144,16 @@ io.on('connection', (socket) => {
     const room = getSocketRoom(socket);
     if (!room) return;
     const leavingPlayer = getPlayer(room, socket.id);
-    const wasDrawer = leavingPlayer?.id === currentDrawer(room)?.id;
+    const drawerBefore = currentDrawer(room);
+    const wasDrawer = leavingPlayer?.id === drawerBefore?.id;
+
+    // Capture who should draw next (by id) before the array shifts, so removing
+    // the drawer doesn't get combined with advanceTurn's own +1 and skip a player.
+    const nextDrawerId = wasDrawer && room.players.length > 1
+      ? room.players[(room.drawerIndex + 1) % room.players.length].id
+      : drawerBefore?.id;
+    const wrapped = wasDrawer && (room.drawerIndex + 1) % room.players.length === 0;
+
     room.players = room.players.filter((player) => player.id !== socket.id);
     socket.leave(room.code);
     if (!room.players.length) {
@@ -149,9 +165,15 @@ io.on('connection', (socket) => {
       room.ownerId = room.players[0].id;
       room.players[0].owner = true;
     }
-    room.drawerIndex = Math.min(room.drawerIndex, room.players.length - 1);
+
+    const preservedIndex = room.players.findIndex((player) => player.id === nextDrawerId);
+    room.drawerIndex = preservedIndex === -1 ? 0 : preservedIndex;
+
     addMessage(room, 'System', `${leavingPlayer?.name || 'A player'} left the room.`, 'system');
-    if (wasDrawer) advanceTurn(room);
+    if (wasDrawer) {
+      clearInterval(room.timerId);
+      beginNextTurn(room, wrapped);
+    }
     emitRoomState(room);
   });
 });
@@ -259,8 +281,17 @@ function startTimer(room) {
 
 function advanceTurn(room) {
   clearInterval(room.timerId);
+  const wrapped = (room.drawerIndex + 1) % room.players.length === 0;
   room.drawerIndex = (room.drawerIndex + 1) % room.players.length;
-  if (room.drawerIndex === 0) room.round += 1;
+  beginNextTurn(room, wrapped);
+  emitRoomState(room);
+}
+
+// Shared phase-transition logic used both by the normal turn-timer flow (advanceTurn)
+// and by the disconnect handler, which computes room.drawerIndex itself to avoid
+// double-advancing when the current drawer leaves mid-turn.
+function beginNextTurn(room, wrapped) {
+  if (wrapped) room.round += 1;
   if (room.round > room.settings.rounds) {
     room.phase = 'gameover';
     room.currentWord = '';
@@ -268,7 +299,6 @@ function advanceTurn(room) {
     room.strokes = [];
     room.players.sort((a, b) => b.score - a.score);
     addMessage(room, 'System', `${room.players[0]?.name || 'Nobody'} wins the game!`, 'system');
-    emitRoomState(room);
     return;
   }
   room.phase = 'choose';
@@ -278,7 +308,6 @@ function advanceTurn(room) {
   room.strokes = [];
   room.players.forEach((player) => { player.guessed = false; });
   addMessage(room, 'System', `${currentDrawer(room).name} is choosing a word.`, 'system');
-  emitRoomState(room);
 }
 
 function sampleWords(room) {
@@ -287,7 +316,16 @@ function sampleWords(room) {
     .map((word) => word.trim().toLowerCase())
     .filter(Boolean);
   const pool = room.settings.customOnly && custom.length ? custom : [...custom, ...WORDS];
-  return [...new Set(pool)].sort(() => Math.random() - 0.5).slice(0, room.settings.wordCount);
+  return shuffle([...new Set(pool)]).slice(0, room.settings.wordCount);
+}
+
+function shuffle(items) {
+  const array = [...items];
+  for (let i = array.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
 }
 
 function wordHint(word, hints, phase, isDrawer) {
