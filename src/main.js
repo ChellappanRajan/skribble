@@ -342,7 +342,12 @@ function patchRoom() {
   const chatSendButton = document.querySelector('.chat-form button');
   if (chatSendButton) chatSendButton.disabled = chatDisabled;
 
-  redrawCanvas();
+  // Skip the redraw while the local user is mid-stroke: only the current drawer
+  // can produce strokes, and moveStroke() already keeps the canvas in sync at a
+  // much higher frequency via its own redrawCanvas() call. Redoing the full
+  // clear-and-repaint here too (every second, from the timer heartbeat) fights
+  // the live stroke for the same frame and is the flicker seen while drawing.
+  if (!isDrawing) redrawCanvas();
 }
 
 function setText(selector, text) {
